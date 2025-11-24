@@ -5,12 +5,6 @@ import { VideoUploader } from './components/VideoUploader';
 import { AudioTrackItem } from './components/AudioTrackItem';
 import { ProcessingModal } from './components/ProcessingModal';
 
-// FFmpeg globals for version 0.11.x
-declare const FFmpeg: {
-  createFFmpeg: (options: any) => any;
-  fetchFile: (file: File | string) => Promise<Uint8Array>;
-};
-
 // Icons
 const PlusIcon = () => (
   <svg xmlns="http://www.w3.org/2000/svg" className="h-5 w-5" viewBox="0 0 20 20" fill="currentColor">
@@ -101,20 +95,26 @@ function App() {
     try {
         setProgressMessage("Carregando sistema de edição...");
         
-        // Use 0.11.6 syntax
-        const ffmpeg = FFmpeg.createFFmpeg({ 
-            log: true,
-            corePath: 'https://unpkg.com/@ffmpeg/core@0.11.0/dist/ffmpeg-core.js',
-        });
+        // Use global variables from UMD scripts in index.html
+        const { FFmpeg } = (window as any).FFmpeg;
+        const { toBlobURL } = (window as any).FFmpegUtil;
+
+        const ffmpeg = new FFmpeg();
         
-        await ffmpeg.load();
+        // Load Single-Threaded Core to avoid "SharedArrayBuffer" errors (Blue Screen/Crashes)
+        const baseURL = 'https://unpkg.com/@ffmpeg/core@0.12.6/dist/umd';
+        
+        await ffmpeg.load({
+            coreURL: await toBlobURL(`${baseURL}/ffmpeg-core.js`, 'text/javascript'),
+            wasmURL: await toBlobURL(`${baseURL}/ffmpeg-core.wasm`, 'application/wasm'),
+        });
         
         ffmpegRef.current = ffmpeg;
         setFfmpegLoaded(true);
         return ffmpeg;
     } catch (error) {
         console.error("Failed to load FFmpeg", error);
-        setErrorMsg("Erro ao carregar sistema de vídeo. Tente recarregar a página.");
+        setErrorMsg("Erro ao carregar sistema de vídeo. Tente usar um navegador recente (Chrome/Edge/Safari).");
         return null;
     }
   };
@@ -127,7 +127,7 @@ function App() {
     setProgressMessage("Iniciando...");
     setResults([]);
 
-    // Give UI a moment to show modal before potentially heavy work
+    // Give UI a moment to show modal
     setTimeout(async () => {
       let ffmpeg = ffmpegRef.current;
       
@@ -141,24 +141,25 @@ function App() {
       }
 
       const generatedResults: ProcessedResult[] = [];
+      const { fetchFile } = (window as any).FFmpegUtil;
 
       try {
           // Write Video File once
           setProgressMessage("Preparando vídeo base...");
           const videoFileName = 'input_video.mp4';
           
-          // FS Write (0.11.x syntax)
-          ffmpeg.FS('writeFile', videoFileName, await FFmpeg.fetchFile(uploadedVideo.file));
+          // FFmpeg 0.12.x API: writeFile
+          await ffmpeg.writeFile(videoFileName, await fetchFile(uploadedVideo.file));
 
           for (let i = 0; i < audioTracks.length; i++) {
               const track = audioTracks[i];
-              setProgressMessage(`Processando vídeo ${i + 1} de ${audioTracks.length}...`);
+              setProgressMessage(`Processando vídeo ${i + 1} de ${audioTracks.length}... (Isso pode demorar)`);
               
               const audioFileName = `audio_${i}.mp3`;
               const outputFileName = `output_${i}.mp4`;
 
               // Write Audio File
-              ffmpeg.FS('writeFile', audioFileName, await FFmpeg.fetchFile(track.file));
+              await ffmpeg.writeFile(audioFileName, await fetchFile(track.file));
 
               // Determine logic
               let filterComplex = "";
@@ -168,11 +169,11 @@ function App() {
               const targetAspectRatio = 9/16;
               const isLandscape = currentAspectRatio > targetAspectRatio + 0.01;
 
-              // SAFETY SCALE: Downscale heavy 4k videos to 1080p equivalent
-              const maxDim = 1280; // Safe for browser
+              // SAFETY SCALE: Downscale heavy videos to prevent browser crash
+              const maxDim = 1280; 
               
               if (isLandscape) {
-                  // Crop logic: scale height to maxDim, crop width to 9:16
+                  // Crop logic: Center crop 9:16
                   needsVideoEncode = true;
                   filterComplex = `scale=-2:${maxDim},crop=ih*(9/16):ih:(iw-ow)/2:0`;
               } else if (uploadedVideo.height > maxDim) {
@@ -184,19 +185,19 @@ function App() {
                   '-i', videoFileName, // Input 0: Video
                   '-ss', track.startTime.toString(), // Seek Audio Input
                   '-i', audioFileName, // Input 1: Audio
-                  '-t', uploadedVideo.duration.toString(), // Duration of output = duration of video
+                  '-t', uploadedVideo.duration.toString(), // Duration = video duration
                   '-map', '0:v', // Use video from 0
                   '-map', '1:a', // Use audio from 1
               ];
 
               if (needsVideoEncode) {
                   ffmpegArgs.push('-vf', filterComplex);
-                  ffmpegArgs.push('-c:v', 'libx264', '-preset', 'ultrafast', '-crf', '28'); 
+                  ffmpegArgs.push('-c:v', 'libx264', '-preset', 'ultrafast', '-crf', '30'); // CRF 30 for speed
               } else {
                   ffmpegArgs.push('-c:v', 'copy'); 
               }
 
-              // Re-encode audio to AAC to ensure proper cuts
+              // Re-encode audio to AAC
               ffmpegArgs.push('-c:a', 'aac');
               
               // Output
@@ -204,12 +205,12 @@ function App() {
 
               console.log(`Run args ${i}:`, ffmpegArgs);
               
-              // Run (0.11.x syntax uses run, not exec)
-              await ffmpeg.run(...ffmpegArgs);
+              // Run (0.12.x syntax uses exec)
+              await ffmpeg.exec(ffmpegArgs);
 
-              // Read the result
+              // Read the result (0.12.x syntax uses readFile)
               try {
-                const data = ffmpeg.FS('readFile', outputFileName);
+                const data = await ffmpeg.readFile(outputFileName);
                 const blob = new Blob([data.buffer], { type: 'video/mp4' });
                 const finalUrl = URL.createObjectURL(blob);
 
@@ -227,22 +228,22 @@ function App() {
                 console.error("Error reading output file", readErr);
               }
               
-              // Cleanup loop files
-              try { ffmpeg.FS('unlink', audioFileName); } catch(e) {}
-              try { ffmpeg.FS('unlink', outputFileName); } catch(e) {}
+              // Cleanup
+              try { await ffmpeg.deleteFile(audioFileName); } catch(e) {}
+              try { await ffmpeg.deleteFile(outputFileName); } catch(e) {}
               
               setProgress(i + 1);
           }
 
           // Cleanup video input
-          try { ffmpeg.FS('unlink', videoFileName); } catch(e) {}
+          try { await ffmpeg.deleteFile(videoFileName); } catch(e) {}
 
           setResults(generatedResults);
           setStep(AppStep.RESULTS);
 
       } catch (e: any) {
           console.error("FFmpeg Processing Error:", e);
-          setErrorMsg("Erro durante o processamento. O navegador pode ter ficado sem memória ou o vídeo é muito pesado.");
+          setErrorMsg("Erro durante o processamento. Tente fechar outras abas para liberar memória.");
           setStep(AppStep.CONFIGURE_AUDIO);
       }
     }, 500);
@@ -308,7 +309,7 @@ function App() {
                                 src={uploadedVideo.url} 
                                 className="w-full h-full object-cover" 
                                 controls 
-                                muted // Always muted in preview as requested ("som do video deve ser descartado")
+                                muted // Always muted in preview
                              />
                              <div className="absolute top-2 left-2 bg-red-500/80 backdrop-blur-md px-2 py-1 rounded-md text-[10px] text-white border border-white/10 flex items-center gap-1">
                                 <svg xmlns="http://www.w3.org/2000/svg" className="h-3 w-3" viewBox="0 0 20 20" fill="currentColor">
