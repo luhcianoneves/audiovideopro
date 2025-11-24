@@ -40,6 +40,7 @@ function App() {
   const [audioTracks, setAudioTracks] = useState<AudioTrack[]>([]);
   const [results, setResults] = useState<ProcessedResult[]>([]);
   const [progress, setProgress] = useState(0);
+  const [progressMessage, setProgressMessage] = useState("");
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
   const [ffmpegLoaded, setFfmpegLoaded] = useState(false);
   const ffmpegRef = useRef<any>(null);
@@ -104,7 +105,7 @@ function App() {
     const ffmpeg = new (window as any).FFmpeg();
     ffmpegRef.current = ffmpeg;
 
-    // Use specific version matching the index.html imports
+    // Use specific version matching the index.html imports (0.12.10)
     const baseURL = 'https://unpkg.com/@ffmpeg/core@0.12.6/dist/umd';
     
     ffmpeg.on('log', ({ message }: { message: string }) => {
@@ -112,17 +113,25 @@ function App() {
     });
 
     try {
-        // Load standard core. Without COOP/COEP headers in vercel.json, 
-        // this relies on the browser allowing it in main thread or without SAB.
-        await ffmpeg.load({
+        setProgressMessage("Carregando sistema de edição (pode demorar na primeira vez)...");
+        
+        // Add a timeout race to prevent infinite hanging
+        const loadPromise = ffmpeg.load({
             coreURL: await (window as any).FFmpegUtil.toBlobURL(`${baseURL}/ffmpeg-core.js`, 'text/javascript'),
             wasmURL: await (window as any).FFmpegUtil.toBlobURL(`${baseURL}/ffmpeg-core.wasm`, 'application/wasm'),
         });
+
+        const timeoutPromise = new Promise((_, reject) => 
+            setTimeout(() => reject(new Error("Tempo limite de carregamento excedido")), 30000)
+        );
+
+        await Promise.race([loadPromise, timeoutPromise]);
+        
         setFfmpegLoaded(true);
         return ffmpeg;
     } catch (error) {
         console.error("Failed to load FFmpeg", error);
-        setErrorMsg("Erro ao carregar sistema de vídeo. Tente usar o Chrome no Desktop.");
+        setErrorMsg("Erro ao carregar sistema de vídeo. Verifique sua conexão ou tente usar o Chrome no PC.");
         return null;
     }
   };
@@ -132,6 +141,7 @@ function App() {
     
     setStep(AppStep.PROCESSING);
     setProgress(0);
+    setProgressMessage("Iniciando...");
     setResults([]);
 
     // Give UI a moment to show modal before freezing
@@ -147,11 +157,14 @@ function App() {
 
       try {
           // Write Video File once
+          setProgressMessage("Preparando vídeo base...");
           const videoFileName = 'input_video.mp4';
           await ffmpeg.writeFile(videoFileName, await (window as any).FFmpegUtil.fetchFile(uploadedVideo.file));
 
           for (let i = 0; i < audioTracks.length; i++) {
               const track = audioTracks[i];
+              setProgressMessage(`Processando vídeo ${i + 1} de ${audioTracks.length}...`);
+              
               const audioFileName = `audio_${i}.mp3`;
               const outputFileName = `output_${i}.mp4`;
 
@@ -164,12 +177,27 @@ function App() {
               
               const currentAspectRatio = uploadedVideo.width / uploadedVideo.height;
               const targetAspectRatio = 9/16;
+              const isLandscape = currentAspectRatio > targetAspectRatio + 0.01;
+
+              // SAFETY SCALE: Downscale heavy 4k videos to 1080p height max to prevent browser crash
+              // If it's landscape, we want the HEIGHT to be 1920 (so we can crop width)
+              // If it's portrait, we want WIDTH to be 1080.
+              const maxDim = 1280; // Safe for browser
               
-              // 1. Crop Logic
-              if (currentAspectRatio > targetAspectRatio + 0.01) {
-                  // Crop center to 9:16
+              if (isLandscape) {
+                  // Logic: Scale so Height is maxDim, then crop width to fit 9:16
+                  // 9:16 of maxDim height = maxDim * (9/16) width.
                   needsVideoEncode = true;
-                  filterComplex = `crop=ih*(9/16):ih:(iw-ow)/2:0`;
+                  // First scale, then crop.
+                  // Scale: -2 means auto-calc maintaining aspect ratio.
+                  // crop=w:h:x:y
+                  // We want final h = maxDim. 
+                  // w = maxDim * (9/16)
+                  filterComplex = `scale=-2:${maxDim},crop=ih*(9/16):ih:(iw-ow)/2:0`;
+              } else if (uploadedVideo.height > maxDim) {
+                  // It's already portrait but too big. Scale down.
+                  needsVideoEncode = true;
+                  filterComplex = `scale=-2:${maxDim}`; 
               }
 
               const ffmpegArgs = [
@@ -182,12 +210,12 @@ function App() {
               ];
 
               if (needsVideoEncode) {
-                  // Apply crop
+                  // Apply crop/scale
                   ffmpegArgs.push('-vf', filterComplex);
                   // preset ultrafast for browser performance
-                  ffmpegArgs.push('-c:v', 'libx264', '-preset', 'ultrafast'); 
+                  ffmpegArgs.push('-c:v', 'libx264', '-preset', 'ultrafast', '-crf', '28'); 
               } else {
-                  // Just copy video stream if AR is correct
+                  // Just copy video stream if AR is correct and size is small
                   ffmpegArgs.push('-c:v', 'copy'); 
               }
 
@@ -235,7 +263,7 @@ function App() {
 
       } catch (e: any) {
           console.error("FFmpeg Processing Error:", e);
-          setErrorMsg("Erro durante o processamento. O navegador pode ter ficado sem memória. Tente com vídeos menores ou menos áudios.");
+          setErrorMsg("Erro durante o processamento. O navegador pode ter ficado sem memória ou o vídeo é muito pesado.");
           setStep(AppStep.CONFIGURE_AUDIO);
       }
     }, 500);
@@ -400,7 +428,7 @@ function App() {
         )}
 
         {step === AppStep.PROCESSING && (
-            <ProcessingModal progress={progress} total={audioTracks.length} />
+            <ProcessingModal progress={progress} total={audioTracks.length} message={progressMessage} />
         )}
 
         {step === AppStep.RESULTS && (
