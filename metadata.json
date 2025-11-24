@@ -1,0 +1,5 @@
+{
+  "name": "AudioVideo Merger Pro",
+  "description": "A secure web application to merge specific audio segments with a video file, featuring precise trimming and gallery export.",
+  "requestFramePermissions": []
+}
