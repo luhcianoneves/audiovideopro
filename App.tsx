@@ -4,15 +4,11 @@ import { LoginScreen } from './components/LoginScreen';
 import { VideoUploader } from './components/VideoUploader';
 import { AudioTrackItem } from './components/AudioTrackItem';
 import { ProcessingModal } from './components/ProcessingModal';
-import { ResultVideoPlayer } from './components/ResultVideoPlayer';
 
-// FFmpeg globals from script tags
-declare const FFmpegWASM: {
-  FFmpeg: any;
-};
-declare const FFmpegUtil: {
+// FFmpeg globals for version 0.11.x
+declare const FFmpeg: {
+  createFFmpeg: (options: any) => any;
   fetchFile: (file: File | string) => Promise<Uint8Array>;
-  toBlobURL: (url: string, type: string) => Promise<string>;
 };
 
 // Icons
@@ -102,36 +98,23 @@ function App() {
   const loadFFmpeg = async () => {
     if (ffmpegLoaded && ffmpegRef.current) return ffmpegRef.current;
 
-    const ffmpeg = new (window as any).FFmpeg();
-    ffmpegRef.current = ffmpeg;
-
-    // Use specific version matching the index.html imports (0.12.10)
-    const baseURL = 'https://unpkg.com/@ffmpeg/core@0.12.6/dist/umd';
-    
-    ffmpeg.on('log', ({ message }: { message: string }) => {
-        console.log('[FFmpeg Log]', message);
-    });
-
     try {
-        setProgressMessage("Carregando sistema de edição (pode demorar na primeira vez)...");
+        setProgressMessage("Carregando sistema de edição...");
         
-        // Add a timeout race to prevent infinite hanging
-        const loadPromise = ffmpeg.load({
-            coreURL: await (window as any).FFmpegUtil.toBlobURL(`${baseURL}/ffmpeg-core.js`, 'text/javascript'),
-            wasmURL: await (window as any).FFmpegUtil.toBlobURL(`${baseURL}/ffmpeg-core.wasm`, 'application/wasm'),
+        // Use 0.11.6 syntax
+        const ffmpeg = FFmpeg.createFFmpeg({ 
+            log: true,
+            corePath: 'https://unpkg.com/@ffmpeg/core@0.11.0/dist/ffmpeg-core.js',
         });
-
-        const timeoutPromise = new Promise((_, reject) => 
-            setTimeout(() => reject(new Error("Tempo limite de carregamento excedido")), 30000)
-        );
-
-        await Promise.race([loadPromise, timeoutPromise]);
         
+        await ffmpeg.load();
+        
+        ffmpegRef.current = ffmpeg;
         setFfmpegLoaded(true);
         return ffmpeg;
     } catch (error) {
         console.error("Failed to load FFmpeg", error);
-        setErrorMsg("Erro ao carregar sistema de vídeo. Verifique sua conexão ou tente usar o Chrome no PC.");
+        setErrorMsg("Erro ao carregar sistema de vídeo. Tente recarregar a página.");
         return null;
     }
   };
@@ -144,9 +127,13 @@ function App() {
     setProgressMessage("Iniciando...");
     setResults([]);
 
-    // Give UI a moment to show modal before freezing
+    // Give UI a moment to show modal before potentially heavy work
     setTimeout(async () => {
-      const ffmpeg = await loadFFmpeg();
+      let ffmpeg = ffmpegRef.current;
+      
+      if (!ffmpeg) {
+          ffmpeg = await loadFFmpeg();
+      }
 
       if (!ffmpeg) {
           setStep(AppStep.CONFIGURE_AUDIO);
@@ -159,7 +146,9 @@ function App() {
           // Write Video File once
           setProgressMessage("Preparando vídeo base...");
           const videoFileName = 'input_video.mp4';
-          await ffmpeg.writeFile(videoFileName, await (window as any).FFmpegUtil.fetchFile(uploadedVideo.file));
+          
+          // FS Write (0.11.x syntax)
+          ffmpeg.FS('writeFile', videoFileName, await FFmpeg.fetchFile(uploadedVideo.file));
 
           for (let i = 0; i < audioTracks.length; i++) {
               const track = audioTracks[i];
@@ -169,7 +158,7 @@ function App() {
               const outputFileName = `output_${i}.mp4`;
 
               // Write Audio File
-              await ffmpeg.writeFile(audioFileName, await (window as any).FFmpegUtil.fetchFile(track.file));
+              ffmpeg.FS('writeFile', audioFileName, await FFmpeg.fetchFile(track.file));
 
               // Determine logic
               let filterComplex = "";
@@ -179,23 +168,14 @@ function App() {
               const targetAspectRatio = 9/16;
               const isLandscape = currentAspectRatio > targetAspectRatio + 0.01;
 
-              // SAFETY SCALE: Downscale heavy 4k videos to 1080p height max to prevent browser crash
-              // If it's landscape, we want the HEIGHT to be 1920 (so we can crop width)
-              // If it's portrait, we want WIDTH to be 1080.
+              // SAFETY SCALE: Downscale heavy 4k videos to 1080p equivalent
               const maxDim = 1280; // Safe for browser
               
               if (isLandscape) {
-                  // Logic: Scale so Height is maxDim, then crop width to fit 9:16
-                  // 9:16 of maxDim height = maxDim * (9/16) width.
+                  // Crop logic: scale height to maxDim, crop width to 9:16
                   needsVideoEncode = true;
-                  // First scale, then crop.
-                  // Scale: -2 means auto-calc maintaining aspect ratio.
-                  // crop=w:h:x:y
-                  // We want final h = maxDim. 
-                  // w = maxDim * (9/16)
                   filterComplex = `scale=-2:${maxDim},crop=ih*(9/16):ih:(iw-ow)/2:0`;
               } else if (uploadedVideo.height > maxDim) {
-                  // It's already portrait but too big. Scale down.
                   needsVideoEncode = true;
                   filterComplex = `scale=-2:${maxDim}`; 
               }
@@ -210,28 +190,27 @@ function App() {
               ];
 
               if (needsVideoEncode) {
-                  // Apply crop/scale
                   ffmpegArgs.push('-vf', filterComplex);
-                  // preset ultrafast for browser performance
                   ffmpegArgs.push('-c:v', 'libx264', '-preset', 'ultrafast', '-crf', '28'); 
               } else {
-                  // Just copy video stream if AR is correct and size is small
                   ffmpegArgs.push('-c:v', 'copy'); 
               }
 
-              // Always re-encode audio to ensure it cuts correctly at the seek point
+              // Re-encode audio to AAC to ensure proper cuts
               ffmpegArgs.push('-c:a', 'aac');
               
               // Output
               ffmpegArgs.push(outputFileName);
 
-              console.log(`Processing ${i + 1}/${audioTracks.length}:`, ffmpegArgs.join(' '));
-              await ffmpeg.exec(ffmpegArgs);
+              console.log(`Run args ${i}:`, ffmpegArgs);
+              
+              // Run (0.11.x syntax uses run, not exec)
+              await ffmpeg.run(...ffmpegArgs);
 
               // Read the result
               try {
-                const data = await ffmpeg.readFile(outputFileName);
-                const blob = new Blob([data], { type: 'video/mp4' });
+                const data = ffmpeg.FS('readFile', outputFileName);
+                const blob = new Blob([data.buffer], { type: 'video/mp4' });
                 const finalUrl = URL.createObjectURL(blob);
 
                 generatedResults.push({
@@ -249,14 +228,14 @@ function App() {
               }
               
               // Cleanup loop files
-              await ffmpeg.deleteFile(audioFileName);
-              try { await ffmpeg.deleteFile(outputFileName); } catch(e) {}
+              try { ffmpeg.FS('unlink', audioFileName); } catch(e) {}
+              try { ffmpeg.FS('unlink', outputFileName); } catch(e) {}
               
               setProgress(i + 1);
           }
 
           // Cleanup video input
-          await ffmpeg.deleteFile(videoFileName);
+          try { ffmpeg.FS('unlink', videoFileName); } catch(e) {}
 
           setResults(generatedResults);
           setStep(AppStep.RESULTS);
